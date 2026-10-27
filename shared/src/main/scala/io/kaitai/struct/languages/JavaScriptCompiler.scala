@@ -81,10 +81,102 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
   }
 
   override def classFooter(name: List[String]): Unit = {
+    if (config.readWrite)
+      compileHydrateMethod()
     out.puts
     out.puts(s"return ${type2class(name.last)};")
     out.dec
     out.puts("})();")
+  }
+
+  private def compileHydrateMethod(): Unit = {
+    val nowClass = typeProvider.nowClass
+    val className = type2class(nowClass.name.last)
+
+    out.puts
+    out.puts(s"$className.prototype._hydrate = function(data) {")
+    out.inc
+
+    nowClass.seq.foreach((attr) =>
+      hydrateField(attr.id, attr.dataType, attr.cond.repeat, s"data.${idToStr(attr.id)}")
+    )
+
+    nowClass.params.foreach((p) =>
+      hydrateField(p.id, p.dataType, NoRepeat, s"data.${idToStr(p.id)}")
+    )
+
+    nowClass.instances.foreach { case (instName, instSpec) =>
+      val rep = instSpec match {
+        case pis: ParseInstanceSpec => pis.cond.repeat
+        case _: ValueInstanceSpec => NoRepeat
+      }
+      hydrateField(instName, instSpec.dataType, rep, s"data.${publicMemberName(instName)}")
+    }
+
+    ExtraAttrs.forClassSpec(nowClass, this).foreach((attr) => {
+      val name = idToStr(attr.id)
+      out.puts(s"if (data.$name !== undefined) {")
+      out.inc
+      out.puts(s"this.$name = ${hydrateValueExpr(attr.dataType, s"data.$name")};")
+      out.dec
+      out.puts("}")
+    })
+
+    out.puts("this._check();")
+
+    out.dec
+    out.puts("}")
+  }
+
+  private def hydrateField(id: Identifier, dataType: DataType, rep: RepeatSpec, dataExpr: String): Unit = {
+    if (rep == NoRepeat) {
+      hydrateAssign(id, dataType, dataExpr)
+    } else {
+      out.puts(s"${privateMemberName(id)} = [];")
+      out.puts(s"if ($dataExpr !== undefined) {")
+      out.inc
+      out.puts(s"for (var i = 0; i < $dataExpr.length; i++) {")
+      out.inc
+      hydrateAssignElem(id, dataType, s"$dataExpr[i]")
+      out.dec
+      out.puts("}")
+      out.dec
+      out.puts("}")
+    }
+  }
+
+  private def hydrateAssign(id: Identifier, dataType: DataType, dataExpr: String): Unit = {
+    out.puts(s"if ($dataExpr !== undefined) {")
+    out.inc
+    hydrateAssignValue(id, dataType, dataExpr, push = false)
+    out.dec
+    out.puts("}")
+  }
+
+  private def hydrateAssignElem(id: Identifier, dataType: DataType, dataElemExpr: String): Unit =
+    hydrateAssignValue(id, dataType, dataElemExpr, push = true)
+
+  private def hydrateAssignValue(id: Identifier, dataType: DataType, dataExpr: String, push: Boolean): Unit = {
+    val target = privateMemberName(id)
+    val emit = (dt: DataType) => {
+      if (push)
+        out.puts(s"$target.push(${hydrateValueExpr(dt, dataExpr)});")
+      else
+        out.puts(s"$target = ${hydrateValueExpr(dt, dataExpr)};")
+    }
+
+    dataType match {
+      case st: SwitchType =>
+        switchCases[DataType](id, st.on, st.cases, emit, emit)
+      case _ =>
+        emit(dataType)
+    }
+  }
+
+  private def hydrateValueExpr(dataType: DataType, dataExpr: String): String = dataType match {
+    case t: UserType => parseExpr(t, dataExpr, None)
+    case _: BytesType => s"$kstreamName.byteArrayFromPlain($dataExpr)"
+    case _ => dataExpr
   }
 
   override def classConstructorHeader(name: List[String], parentClassName: DataType, rootClassName: List[String], isHybrid: Boolean, params: List[ParamDefSpec]): Unit = {
@@ -98,7 +190,11 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
 
     out.puts(s"function ${type2class(name.last)}(_io, _parent, _root$endianSuffix$paramsList) {")
     out.inc
-    out.puts("Object.defineProperty(this, '_io', { value: _io, writable: true, enumerable: false });")
+    if (config.readWrite) {
+      out.puts("var _data = (_io !== null && typeof _io === 'object' && !(_io instanceof KaitaiStream)) ? _io : null;")
+    }
+    val ioValueExpr = if (config.readWrite) "_data !== null ? null : _io" else "_io"
+    out.puts(s"Object.defineProperty(this, '_io', { value: $ioValueExpr, writable: true, enumerable: false });")
     out.puts("Object.defineProperty(this, '_parent', { value: _parent, writable: true, enumerable: false });")
     if (name == rootClassName) {
       out.puts("Object.defineProperty(this, '_root', { value: _root || this, writable: true, enumerable: false });")
@@ -126,13 +222,26 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
   override def classConstructorFooter: Unit = {
     if (config.readWrite) {
       out.puts("Object.defineProperty(this, '_dirty', { value: true, writable: true, enumerable: false });")
+      out.puts("if (_data !== null) {")
+      out.inc
+      out.puts("this._hydrate(_data);")
+      out.dec
+      out.puts("}")
     }
     out.dec
     out.puts("}")
   }
 
   override def runRead(name: List[String]): Unit = {
-    out.puts("this._read();")
+    if (config.readWrite) {
+      out.puts("if (_data === null) {")
+      out.inc
+      out.puts("this._read();")
+      out.dec
+      out.puts("}")
+    } else {
+      out.puts("this._read();")
+    }
   }
 
   override def runReadCalc(): Unit = {
@@ -377,7 +486,7 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
     val ifExpr = if (expectedIsEof) {
       s"!($eofExpr)"
     } else {
-      eofExpr
+      s"$eofExpr && $io.isFixed()"
     }
     out.puts(s"if ($ifExpr) {")
     out.inc
