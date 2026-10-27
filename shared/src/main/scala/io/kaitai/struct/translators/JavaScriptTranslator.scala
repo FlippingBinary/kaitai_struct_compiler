@@ -44,7 +44,14 @@ class JavaScriptTranslator(provider: TypeProvider, importList: ImportList) exten
       case "_" => s
       case Identifier.SWITCH_ON => "on"
       case Identifier.INDEX => "i"
-      case _ => s"this.${doName(s)}"
+      case _ =>
+        if (inSubIOWriteBackHandler) {
+          // inside a substream write-back handler function the enclosing object is available
+          // as the local variable `_this`
+          s"_this.${doName(s)}"
+        } else {
+          s"this.${doName(s)}"
+        }
     }
   }
 
@@ -56,7 +63,7 @@ class JavaScriptTranslator(provider: TypeProvider, importList: ImportList) exten
   }
 
   override def doInternalName(id: Identifier): String =
-    JavaScriptCompiler.privateMemberName(id)
+    JavaScriptCompiler.privateMemberName(id, inSubIOWriteBackHandler)
 
   override def doEnumByLabel(enumSpec: EnumSpec, label: String): String = {
     val isExternal = enumSpec.isExternal(provider.nowClass)
@@ -117,6 +124,12 @@ class JavaScriptTranslator(provider: TypeProvider, importList: ImportList) exten
 
   override def bytesToStr(bytesExpr: String, encoding: String): String =
     s"""${JavaScriptCompiler.kstreamName}.bytesToStr($bytesExpr, ${doStringLiteral(encoding)})"""
+
+  override def strToBytes(s: expr, encoding: expr): String =
+    s"${JavaScriptCompiler.kstreamName}.strToBytes(${translate(s)}, ${translate(encoding)})"
+
+  override def bytesIndexOf(b: expr, byte: expr): String =
+    s"${JavaScriptCompiler.kstreamName}.byteArrayIndexOf(${translate(b)}, ${translate(byte)})"
 
   override def strLength(s: expr): String =
     s"${translate(s, METHOD_PRECEDENCE)}.length"

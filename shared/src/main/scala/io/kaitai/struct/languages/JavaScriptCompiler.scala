@@ -17,10 +17,14 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
     with UniversalDoc
     with AllocateIOLocalVar
     with EveryReadIsExpression
+    with FetchInstances
+    with EveryWriteIsExpression
     with SwitchIfOps {
   import JavaScriptCompiler._
 
   override val translator = new JavaScriptTranslator(typeProvider, importList)
+
+  private var subIOCapturedVars: List[String] = Nil
 
   override def indent: String = "  "
   override def outFileName(topClassName: String): String = s"${type2class(topClassName)}.js"
@@ -115,6 +119,9 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
   }
 
   override def classConstructorFooter: Unit = {
+    if (config.readWrite) {
+      out.puts("Object.defineProperty(this, '_dirty', { value: true, writable: true, enumerable: false });")
+    }
     out.dec
     out.puts("}")
   }
@@ -150,9 +157,415 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
   }
 
   override def readFooter() = {
+    if (config.readWrite) {
+      out.puts("this._dirty = false;")
+    }
     out.dec
     out.puts("}")
   }
+
+  override def fetchInstancesHeader(): Unit = {
+    out.puts
+    out.puts(s"${type2class(typeProvider.nowClass.name.last)}.prototype._fetchInstances = function() {")
+    out.inc
+  }
+
+  override def fetchInstancesFooter: Unit = {
+    out.dec
+    out.puts("}")
+  }
+
+  override def attrInvokeFetchInstances(baseExpr: Ast.expr, exprType: DataType, dataType: DataType): Unit = {
+    out.puts(s"${expression(baseExpr)}._fetchInstances();")
+  }
+
+  override def attrInvokeInstance(instName: InstanceIdentifier): Unit = {
+    out.puts(s"this.${publicMemberName(instName)};")
+  }
+
+  override def instanceHasValueIfHeader(instName: InstanceIdentifier): Unit = {
+    out.puts(s"if (${privateMemberName(instName)} !== undefined) {")
+    out.inc
+  }
+
+  override def instanceHasValueIfFooter(): Unit = {
+    out.dec
+    out.puts("}")
+  }
+
+  //<editor-fold desc="writing">
+
+  override def runWriteCalc(): Unit = {
+    out.puts
+    out.puts("if (this._is_le === true) {")
+    out.inc
+    out.puts("this._write_SeqLE();")
+    out.dec
+    out.puts("} else if (this._is_le === false) {")
+    out.inc
+    out.puts("this._write_SeqBE();")
+    out.dec
+    out.puts("} else {")
+    out.inc
+    out.puts("throw new KaitaiStream.UndecidedEndiannessError();")
+    out.dec
+    out.puts("}")
+  }
+
+  override def writeHeader(endian: Option[FixedEndian], isEmpty: Boolean): Unit = {
+    val className = type2class(typeProvider.nowClass.name.last)
+    val suffix = endian match {
+      case Some(e) => Utils.upperUnderscoreCase(e.toSuffix)
+      case None => ""
+    }
+
+    if (endian.isEmpty) {
+      out.puts
+      out.puts(s"$className.prototype._write = function(io) {")
+      out.inc
+      out.puts("this._write_Seq(io);")
+      out.puts("this._fetchInstances();")
+      out.puts("this._io.writeBackChildStreams();")
+      out.dec
+      out.puts("}")
+    }
+
+    out.puts(s"$className.prototype._write_Seq$suffix = function(${if (endian.isEmpty) "io" else ""}) {")
+    out.inc
+    if (endian.isEmpty) {
+      out.puts("if (io !== undefined) {")
+      out.inc
+      out.puts("this._io = io;")
+      out.dec
+      out.puts("}")
+      out.puts("if (this._dirty) {")
+      out.inc
+      out.puts("throw new KaitaiStream.ConsistencyNotCheckedError(\"consistency not checked: _check() has not been called since the last modification of the object\");")
+      out.dec
+      out.puts("}")
+    }
+  }
+
+  override def writeFooter(): Unit = {
+    out.dec
+    out.puts("}")
+  }
+
+  override def writeInstanceHeader(instName: InstanceIdentifier): Unit = {
+    out.puts
+    out.puts(s"${type2class(typeProvider.nowClass.name.last)}.prototype._write${idToSetterStr(instName)} = function() {")
+    out.inc
+    instanceClearWriteFlag(instName)
+  }
+
+  override def writeInstanceFooter(): Unit = {
+    out.dec
+    out.puts("}")
+  }
+
+  override def checkHeader(): Unit = {
+    out.puts
+    out.puts(s"${type2class(typeProvider.nowClass.name.last)}.prototype._check = function() {")
+    out.inc
+  }
+
+  override def checkFooter(): Unit = {
+    out.puts("this._dirty = false;")
+    out.dec
+    out.puts("}")
+  }
+
+  override def checkInstanceHeader(instName: InstanceIdentifier): Unit = {
+    out.puts(s"if (this._enabled${idToSetterStr(instName)}) {")
+    out.inc
+  }
+
+  override def checkInstanceFooter(): Unit = {
+    out.dec
+    out.puts("}")
+  }
+
+  override def internalEnumIntType(basedOn: IntType): DataType = basedOn
+
+  override def attrSetProperty(base: Ast.expr, propName: Identifier, value: String): Unit = {
+    out.puts(s"${expression(base)}.${idToStr(propName)} = $value;")
+  }
+
+  override def attrPrimitiveWrite(
+    io: String,
+    valueExpr: Ast.expr,
+    dataType: DataType,
+    defEndian: Option[FixedEndian],
+    exprTypeOpt: Option[DataType]
+  ): Unit = {
+    val expr = expression(valueExpr)
+
+    val stmt = dataType match {
+      case t: ReadableType =>
+        s"$io.write${Utils.capitalize(t.apiCall(defEndian))}($expr)"
+      case BitsType1(bitEndian) =>
+        s"$io.writeBitsInt${Utils.upperCamelCase(bitEndian.toSuffix)}(1, ${translator.boolToInt(valueExpr)})"
+      case BitsType(width: Int, bitEndian) =>
+        s"$io.writeBitsInt${Utils.upperCamelCase(bitEndian.toSuffix)}($width, $expr)"
+      case _: BytesType =>
+        s"$io.writeBytes($expr)"
+    }
+    out.puts(stmt + ";")
+  }
+
+  override def attrBytesLimitWrite(io: String, expr: Ast.expr, size: String, term: Int, padRight: Int): Unit =
+    out.puts(s"$io.writeBytesLimit(${expression(expr)}, $size, $term, $padRight);")
+
+  override def attrUserTypeInstreamWrite(io: String, valueExpr: Ast.expr, dataType: DataType, exprType: DataType) = {
+    out.puts(s"${expression(valueExpr)}._write_Seq($io);")
+  }
+
+  override def exprStreamToByteArray(io: String): String =
+    s"$io.toByteArray()"
+
+  override def exprIORemainingSize(io: String): String =
+    s"$io.size - $io.pos"
+
+  override def attrBasicCheck(checkExpr: Ast.expr, actual: Ast.expr, expected: Ast.expr, msg: String): Unit = {
+    val msgStr = expression(Ast.expr.Str(msg))
+
+    out.puts(s"if (${expression(checkExpr)}) {")
+    out.inc
+    out.puts(s"throw new KaitaiStream.ConsistencyError($msgStr, ${expression(expected)}, ${expression(actual)});")
+    out.dec
+    out.puts("}")
+  }
+
+  override def attrObjectsEqualCheck(actual: Ast.expr, expected: Ast.expr, msg: String): Unit = {
+    val msgStr = expression(Ast.expr.Str(msg))
+
+    out.puts(s"if (!KaitaiStream.objectsEqual(${expression(actual)}, ${expression(expected)})) {")
+    out.inc
+    out.puts(s"throw new KaitaiStream.ConsistencyError($msgStr, ${expression(expected)}, ${expression(actual)});")
+    out.dec
+    out.puts("}")
+  }
+
+  override def attrParentParamCheck(actualParentExpr: Ast.expr, ut: UserType, shouldDependOnIo: Option[Boolean], msg: String): Unit = {
+    val (expectedParent, dependsOnIo) = ut.forcedParent match {
+      case Some(USER_TYPE_NO_PARENT) => ("null", false)
+      case Some(fp) =>
+        (expression(fp), userExprDependsOnIo(fp))
+      case None => ("this", false)
+    }
+    if (shouldDependOnIo.map(shouldDepend => dependsOnIo != shouldDepend).getOrElse(false))
+      return
+
+    val msgStr = expression(Ast.expr.Str(msg))
+
+    out.puts(s"if (${expression(actualParentExpr)} !== $expectedParent) {")
+    out.inc
+    out.puts(s"throw new KaitaiStream.ConsistencyError($msgStr, $expectedParent, ${expression(actualParentExpr)});")
+    out.dec
+    out.puts("}")
+  }
+
+  override def attrIsEofCheck(io: String, expectedIsEof: Boolean, msg: String): Unit = {
+    val msgStr = expression(Ast.expr.Str(msg))
+
+    val eofExpr = s"$io.isEof()"
+    val ifExpr = if (expectedIsEof) {
+      s"!($eofExpr)"
+    } else {
+      eofExpr
+    }
+    out.puts(s"if ($ifExpr) {")
+    out.inc
+    out.puts(s"throw new KaitaiStream.ConsistencyError($msgStr, 0, ${exprIORemainingSize(io)});")
+    out.dec
+    out.puts("}")
+  }
+
+  override def condIfIsEofHeader(io: String, wantedIsEof: Boolean): Unit = {
+    val eofExpr = s"$io.isEof()"
+    val ifExpr = if (!wantedIsEof) {
+      s"!($eofExpr)"
+    } else {
+      eofExpr
+    }
+
+    out.puts(s"if ($ifExpr) {")
+    out.inc
+  }
+
+  override def condIfIsEofFooter: Unit = condIfFooter
+
+  override def blockScopeHeader: Unit = {
+    out.puts("{")
+    out.inc
+  }
+
+  override def blockScopeFooter: Unit = {
+    out.dec
+    out.puts("}")
+  }
+
+  override def condRepeatCommonHeader(id: Identifier, io: String, dataType: DataType): Unit = {
+    out.puts(s"for (var i = 0; i < ${privateMemberName(id)}.length; i++) {")
+    out.inc
+  }
+
+  override def condRepeatCommonFooter: Unit = {
+    out.dec
+    out.puts("}")
+  }
+
+  override def pushPosForSubIOWriteBackHandler(io: String): Unit =
+    out.puts(s"var _pos2 = $io.pos;")
+
+  override def seekRelative(io: String, relPos: String): Unit =
+    out.puts(s"$io.seek($io.pos + ($relPos));")
+
+  override def allocateIOFixed(varName: Identifier, size: String): String = {
+    val langName = idToStr(varName)
+    val ioName = s"_io_$langName"
+
+    out.puts(s"var $ioName = new $kstreamName($size);")
+    ioName
+  }
+
+  override def subIOWriteBackHeader(subIO: String, rep: RepeatSpec, process: Option[ProcessExpr]): String = {
+    val parentIoName = "parent"
+    out.puts("var _this = this;")
+    val indexArg = rep match {
+      case NoRepeat => None
+      case _ => Some("i")
+    }
+    val processValArg = process.map(proc => proc match {
+      case _: ProcessXor | _: ProcessRotate | _: ProcessCustom => Some("_process_val")
+      case _ => None
+    }).getOrElse(None)
+    subIOCapturedVars = (Some(subIO) ++ indexArg ++ processValArg).toList
+    out.puts(s"(function(${subIOCapturedVars.mkString(", ")}) {")
+    out.inc
+    out.puts(s"$subIO.setWriteBackHandler(_pos2, function($parentIoName) {")
+    out.inc
+
+    translator.inSubIOWriteBackHandler = true
+
+    parentIoName
+  }
+
+  override def subIOWriteBackFooter(subIO: String): Unit = {
+    translator.inSubIOWriteBackHandler = false
+
+    out.dec
+    out.puts("});")
+    out.dec
+    out.puts(s"})(${subIOCapturedVars.mkString(", ")});")
+    subIOCapturedVars = Nil
+  }
+
+  override def addChildIO(io: String, childIO: String): Unit =
+    out.puts(s"$io.addChildStream($childIO);")
+
+  private def customProcessExpr(name: List[String], args: Seq[Ast.expr]): String = {
+    val nameInit = name.init
+    val pkgName = if (nameInit.isEmpty) "" else nameInit.mkString("-") + "/"
+    val procClass = type2class(name.last)
+
+    importList.add(s"$pkgName$procClass")
+
+    s"new ${procClass}_.${procClass}(${args.map(expression).mkString(", ")})"
+  }
+
+  override def attrUnprocess(proc: ProcessExpr, varSrc: Identifier, varDest: Identifier, rep: RepeatSpec, dataType: BytesType, exprTypeOpt: Option[DataType]): Unit = {
+    val srcExpr = expression(Identifier.itemExpr(varSrc, rep))
+
+    val expr = proc match {
+      case ProcessXor(xorValue) =>
+        val argStr = if (translator.inSubIOWriteBackHandler) "_process_val" else expression(xorValue)
+        val procName = translator.detectType(xorValue) match {
+          case _: IntType => "processXorOne"
+          case _: BytesType => "processXorMany"
+        }
+        s"$kstreamName.$procName($srcExpr, $argStr)"
+      case ProcessZlib =>
+        s"$kstreamName.unprocessZlib($srcExpr)"
+      case ProcessRotate(isLeft, rotValue) =>
+        val argStr = if (translator.inSubIOWriteBackHandler) "_process_val" else expression(rotValue)
+        val rotExpr = if (isLeft) {
+          s"8 - ($argStr)"
+        } else {
+          argStr
+        }
+        s"$kstreamName.processRotateLeft($srcExpr, $rotExpr, 1)"
+      case ProcessCustom(name, args) =>
+        val procName = if (translator.inSubIOWriteBackHandler) {
+          "_process_val"
+        } else {
+          val n = s"_process_${idToStr(varSrc)}"
+          out.puts(s"var $n = ${customProcessExpr(name, args)};")
+          n
+        }
+        s"$procName.encode($srcExpr)"
+    }
+    handleAssignment(varDest, expr, rep, false, dataType, dataType)
+  }
+
+  override def attrUnprocessPrepareBeforeSubIOHandler(proc: ProcessExpr, varSrc: Identifier): Unit = {
+    proc match {
+      case ProcessXor(xorValue) =>
+        out.puts(s"var _process_val = ${expression(xorValue)};")
+      case ProcessRotate(_, rotValue) =>
+        out.puts(s"var _process_val = ${expression(rotValue)};")
+      case ProcessZlib => // no process arguments
+      case ProcessCustom(name, args) =>
+        out.puts(s"var _process_val = ${customProcessExpr(name, args)};")
+    }
+  }
+
+  override def instanceWriteFlagDeclaration(attrName: InstanceIdentifier): Unit = {}
+
+  override def instanceWriteFlagInit(attrName: InstanceIdentifier): Unit = {
+    // `_shouldWrite*` and `_enabled*` needs to be non-enumerable
+    out.puts(s"Object.defineProperty(this, '_shouldWrite${idToSetterStr(attrName)}', { value: false, writable: true, enumerable: false });")
+    out.puts(s"Object.defineProperty(this, '_enabled${idToSetterStr(attrName)}', { value: true, writable: true, enumerable: false });")
+  }
+
+  override def instanceSetWriteFlag(instName: InstanceIdentifier): Unit = {
+    out.puts(s"this._shouldWrite${idToSetterStr(instName)} = this._enabled${idToSetterStr(instName)};")
+  }
+
+  override def instanceClearWriteFlag(instName: InstanceIdentifier): Unit = {
+    out.puts(s"this._shouldWrite${idToSetterStr(instName)} = false;")
+  }
+
+  override def instanceEnabledSetter(instName: InstanceIdentifier): Unit = {
+    // the flag is a plain property, so it can be assigned directly by the user
+  }
+
+  override def instanceCheckWriteFlagAndWrite(instName: InstanceIdentifier): Unit = {
+    out.puts(s"if (this._shouldWrite${idToSetterStr(instName)}) {")
+    out.inc
+    out.puts(s"this._write${idToSetterStr(instName)}();")
+    out.dec
+    out.puts("}")
+  }
+
+  override def instanceReturnNullIfDisabled(instName: InstanceIdentifier): Unit = {
+    out.puts(s"if (!this._enabled${idToSetterStr(instName)}) {")
+    out.inc
+    out.puts("return null;")
+    out.dec
+    out.puts("}")
+    out.puts
+  }
+
+  override def instanceInvalidate(instName: InstanceIdentifier): Unit = {
+    out.puts(s"${type2class(typeProvider.nowClass.name.last)}.prototype._invalidate${idToSetterStr(instName)} = function() {")
+    out.inc
+    out.puts(s"${privateMemberName(instName)} = undefined;")
+    out.dec
+    out.puts("}")
+  }
+
+  //</editor-fold>
 
   override def attributeDeclaration(attrName: Identifier, attrType: DataType, isNullable: Boolean): Unit = {}
 
@@ -503,8 +916,31 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
   override def instanceHeader(className: List[String], instName: InstanceIdentifier, dataType: DataType, isNullable: Boolean): Unit = {
     out.puts(s"Object.defineProperty(${type2class(className.last)}.prototype, '${publicMemberName(instName)}', {")
     out.inc
+    if (config.readWrite) {
+      out.puts("configurable: true,")
+    }
     out.puts("get: function() {")
     out.inc
+  }
+
+  override def attributeSetter(attrName: Identifier, attrType: DataType, isNullable: Boolean): Unit = {
+    attrName match {
+      case instName: InstanceIdentifier =>
+        val className = type2class(typeProvider.nowClass.name.last)
+
+        out.puts(s"Object.defineProperty($className.prototype, '${publicMemberName(instName)}', {")
+        out.inc
+        out.puts("set: function(v) {")
+        out.inc
+        out.puts("this._dirty = true;")
+        out.puts(s"${privateMemberName(instName)} = v;")
+        out.dec
+        out.puts("}")
+        out.dec
+        out.puts("});")
+      case _ =>
+        // seq attributes and parameters are plain properties in JavaScript
+    }
   }
 
   override def instanceFooter: Unit = {
@@ -576,7 +1012,8 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
       case _ => idToStr(id)
     }
 
-  override def privateMemberName(id: Identifier): String = JavaScriptCompiler.privateMemberName(id)
+  override def privateMemberName(id: Identifier): String =
+    JavaScriptCompiler.privateMemberName(id, translator.inSubIOWriteBackHandler)
 
   override def localTemporaryName(id: Identifier): String = s"_t_${idToStr(id)}"
 
@@ -659,9 +1096,27 @@ object JavaScriptCompiler extends LanguageCompilerStatic
       case NumberedIdentifier(idx) => s"_${NumberedIdentifier.TEMPLATE}$idx"
       case InstanceIdentifier(name) => s"_m_${Utils.lowerCamelCase(name)}"
       case RawIdentifier(innerId) => s"_raw_${idToStr(innerId)}"
+      case OuterSizeIdentifier(innerId) => s"${idToStr(innerId)}__outer_size"
+      case InnerSizeIdentifier(innerId) => s"${idToStr(innerId)}__inner_size"
+    }
+
+  def idToSetterStr(id: Identifier): String =
+    id match {
+      case SpecialIdentifier(name) => name
+      case NamedIdentifier(name) => Utils.upperCamelCase(name)
+      case NumberedIdentifier(idx) => s"_${NumberedIdentifier.TEMPLATE}$idx"
+      case InstanceIdentifier(name) => Utils.upperCamelCase(name)
+      case RawIdentifier(innerId) => "_raw_" + idToSetterStr(innerId)
     }
 
   def privateMemberName(id: Identifier): String = s"this.${idToStr(id)}"
+
+  def privateMemberName(id: Identifier, inSubIOWriteBackHandler: Boolean): String =
+    if (inSubIOWriteBackHandler) {
+      s"_this.${idToStr(id)}"
+    } else {
+      privateMemberName(id)
+    }
 
   override def kstreamName: String = "KaitaiStream"
 
