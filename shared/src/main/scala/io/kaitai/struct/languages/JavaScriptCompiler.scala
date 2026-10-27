@@ -94,22 +94,27 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
 
     out.puts(s"function ${type2class(name.last)}(_io, _parent, _root$endianSuffix$paramsList) {")
     out.inc
-    out.puts("this._io = _io;")
-    out.puts("this._parent = _parent;")
+    out.puts("Object.defineProperty(this, '_io', { value: _io, writable: true, enumerable: false });")
+    out.puts("Object.defineProperty(this, '_parent', { value: _parent, writable: true, enumerable: false });")
     if (name == rootClassName) {
-      out.puts("this._root = _root || this;")
+      out.puts("Object.defineProperty(this, '_root', { value: _root || this, writable: true, enumerable: false });")
     } else {
-      out.puts("this._root = _root;")
+      out.puts("Object.defineProperty(this, '_root', { value: _root, writable: true, enumerable: false });")
     }
 
     if (isHybrid)
-      out.puts("this._is_le = _is_le;")
+      out.puts("Object.defineProperty(this, '_is_le', { value: _is_le, writable: true, enumerable: false });")
+
+    // `_raw_*` needs to be non-enumerable
+    ExtraAttrs.forClassSpec(typeProvider.nowClass, this).foreach((attr) =>
+      out.puts(s"Object.defineProperty(this, '${idToStr(attr.id)}', { value: undefined, writable: true, enumerable: false });")
+    )
 
     // Store parameters passed to us
     params.foreach((p) => handleAssignmentSimple(p.id, paramName(p.id)))
 
     if (config.readStoresPos) {
-      out.puts("this._debug = {};")
+      out.puts("Object.defineProperty(this, '_debug', { value: {}, writable: true, enumerable: false });")
     }
     out.puts
   }
@@ -524,6 +529,10 @@ class JavaScriptCompiler(typeProvider: ClassTypeProvider, config: RuntimeConfig)
   override def instanceReturn(instName: InstanceIdentifier, attrType: DataType, isNullable: Boolean): Unit = {
     out.puts(s"return ${privateMemberName(instName)};")
   }
+
+  // `_m_*` needs to be non-enumerable
+  override def instanceClear(instName: InstanceIdentifier): Unit =
+    out.puts(s"Object.defineProperty(this, '${idToStr(instName)}', { value: undefined, writable: true, enumerable: false });")
 
   override def enumDeclaration(curClass: List[String], enumName: String, enumColl: Seq[(BigInt, EnumValueSpec)]): Unit = {
     out.puts(s"${type2class(curClass.last)}.${type2class(enumName)} = Object.freeze({")
